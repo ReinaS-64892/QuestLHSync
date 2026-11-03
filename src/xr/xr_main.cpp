@@ -3,8 +3,7 @@
 //   - the same headset link and solver (net.cpp, sync.cpp): lhsyncd's camera sightings of the base stations, and the
 //     headset's poses, give the 4-DOF transform from the lighthouse universe to the headset's;
 //   - the headset's and the lighthouse devices' poses come over OpenXR (XR_MNDX_xdev_space, a headless session: what
-//     motoc uses), the base stations' from SteamVR's lighthousedb.json (Monado's steamvr_lh driver doesn't make them
-//     devices);
+//     motoc uses), including LHB- base stations exported by the patched steamvr_lh driver;
 //   - the transform is applied as the lighthouse devices' tracking origin offset, through libmonado.
 // Both libraries are opened at run time, from the active OpenXR runtime's manifest (MND_libmonado_path).
 //   questlhsync-xr [--host IP[,IP]] [--headset SERIAL] [--runtime manifest.json]   the window (--no-window: none)
@@ -150,6 +149,18 @@ struct Mnd {
     }
     return true;
   }
+  // libmonado caches device/origin lists at root creation. Refresh that snapshot
+  // alongside OpenXR's list so late base stations also get their correct origin.
+  bool Refresh() {
+    mnd_root_t *fresh = nullptr;
+    if (create(&fresh) != MND_SUCCESS || !fresh) {
+      if (fresh) destroy(&fresh);
+      return false;
+    }
+    Disconnect();
+    root = fresh;
+    return true;
+  }
   bool Connect() {
     if (root) return true;
     return create(&root) == MND_SUCCESS && root;
@@ -260,12 +271,12 @@ struct Xr {
     }
   }
 
-  XrTime Now() {
+  XrTime Now(double &pc_time) {
     timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     XrTime t = 0;
-    xrConvertTimespecTimeToTimeKHR(inst, &ts, &t);
-    return t;
+    pc_time = ts.tv_sec + ts.tv_nsec / 1e9;
+    return XR_SUCCEEDED(xrConvertTimespecTimeToTimeKHR(inst, &ts, &t)) ? t : 0;
   }
 };
 
@@ -276,13 +287,14 @@ struct Dev {
   XrSpace space = XR_NULL_HANDLE;
   int mnd = -1;                  // libmonado's device index
   uint32_t origin = UINT32_MAX;  // its tracking origin
-  bool hmd = false, lighthouse = false;
+  bool hmd = false, lighthouse = false, station = false;
 };
 
 static std::string Cut(const char *s) { return s ? s : ""; }
 
 // every xdev with a space, matched to libmonado's device of the same serial (else name) for its tracking origin
 static bool Enumerate(Xr &xr, Mnd &mnd, std::vector<Dev> &out, std::map<uint32_t, std::string> &origins) {
+  if (!mnd.Refresh()) return false;
   for (auto &d : out)
     if (d.space) xr.xrDestroySpace(d.space);
   out.clear();
@@ -292,13 +304,12 @@ static bool Enumerate(Xr &xr, Mnd &mnd, std::vector<Dev> &out, std::map<uint32_t
   XrCreateXDevListInfoMNDX li{XR_TYPE_CREATE_XDEV_LIST_INFO_MNDX};
   if (XR_FAILED(xr.xrCreateXDevListMNDX(xr.ses, &li, &xr.list))) return false;
   uint32_t n = 0;
-  xr.xrEnumerateXDevsMNDX(xr.list, 0, &n, nullptr);
+  if (XR_FAILED(xr.xrEnumerateXDevsMNDX(xr.list, 0, &n, nullptr))) return false;
   std::vector<XrXDevIdMNDX> ids(n);
-  if (n) xr.xrEnumerateXDevsMNDX(xr.list, n, &n, ids.data());
+  if (n && XR_FAILED(xr.xrEnumerateXDevsMNDX(xr.list, n, &n, ids.data()))) return false;
 
   uint32_t nm = 0, no = 0;
-  mnd.count(mnd.root, &nm);
-  mnd.origin_count(mnd.root, &no);
+  if (mnd.count(mnd.root, &nm) != MND_SUCCESS || mnd.origin_count(mnd.root, &no) != MND_SUCCESS) return false;
   for (uint32_t i = 0; i < no; i++) {
     const char *nm_ = nullptr;
     if (mnd.origin_name(mnd.root, i, &nm_) == MND_SUCCESS) origins[i] = Cut(nm_);
@@ -310,11 +321,13 @@ static bool Enumerate(Xr &xr, Mnd &mnd, std::vector<Dev> &out, std::map<uint32_t
   for (uint32_t i = 0; i < nm; i++) {
     uint32_t id;
     const char *name = nullptr, *serial = nullptr;
-    mnd.info(mnd.root, i, &id, &name);
+    if (mnd.info(mnd.root, i, &id, &name) != MND_SUCCESS) return false;
+    std::string device_name = Cut(name); // returned strings need copying before the next libmonado call
     if (mnd.info_str(mnd.root, i, MND_PROPERTY_SERIAL_STRING, &serial) != MND_SUCCESS) serial = nullptr;
+    std::string device_serial = Cut(serial);
     uint32_t o = UINT32_MAX;
     if (mnd.info_u32(mnd.root, i, MND_PROPERTY_TRACKING_ORIGIN_U32, &o) != MND_SUCCESS) o = UINT32_MAX;
-    ms[i] = {Cut(name), Cut(serial), o};
+    ms[i] = {device_name, device_serial, o};
   }
   for (XrXDevIdMNDX id : ids) {
     XrGetXDevInfoMNDX gi{XR_TYPE_GET_XDEV_INFO_MNDX};
@@ -337,7 +350,8 @@ static bool Enumerate(Xr &xr, Mnd &mnd, std::vector<Dev> &out, std::map<uint32_t
         d.hmd = (int)i == head;
         break;
       }
-    d.lighthouse = d.serial.rfind("LHR-", 0) == 0;
+    d.station = d.serial.rfind("LHB-", 0) == 0;
+    d.lighthouse = d.station || d.serial.rfind("LHR-", 0) == 0;
     out.push_back(std::move(d));
   }
   return true;
@@ -353,16 +367,105 @@ static bool Locate(Xr &xr, const Dev &d, XrTime t, Rig &out) {
   return true;
 }
 
-// ---------------------------------------------------------------- base stations (SteamVR's lighthousedb.json)
-// known_universes[].base_stations[].target_pose.pose = qx qy qz qw tx ty tz, the universe in the station's frame (target
-// 0): the station sits at -R^T t, turned by R^T. The lighthouse driver reports its devices in that universe tilted to
-// gravity by the universe's own pitch and roll, Rx(-pitch) Rz(-roll). (Checked against stations the SteamVR driver
-// measured: positions within 5 cm, orientations within 0.5 deg.)
-struct Stations {
-  std::map<std::string, std::pair<V3, M3>> raw;
-  std::map<std::string, int> channel;
+// ---------------------------------------------------------------- live tracking input
+static bool Valid(const Rig &r) {
+  double q = r.q.w * r.q.w + r.q.x * r.q.x + r.q.y * r.q.y + r.q.z * r.q.z;
+  return std::isfinite(r.p.x) && std::isfinite(r.p.y) && std::isfinite(r.p.z) &&
+         std::isfinite(q) && std::fabs(q - 1) < 0.01;
+}
+
+static bool Same(const Rig &a, const Rig &b) {
+  return norm(a.p - b.p) < 1e-6 && QuatDeg(a.q, b.q) < 1e-4;
+}
+
+struct TrackingFrame {
+  std::map<std::string, std::pair<V3, M3>> stations;
+  std::map<int, V3> bodies;
+  Rig hmd, offset;
+  bool have_hmd = false;
+  uint32_t origin = UINT32_MAX;
+  std::string issue;
 };
 
+// All locations use the same XrTime and STAGE. Read offsets on both sides of
+// the batch, rejecting a batch that straddles another tool's space adjustment.
+// Only the Lighthouse origin is writable; STAGE/LOCAL remain the user's.
+static TrackingFrame ReadTrackingFrame(Xr &xr, Mnd &mnd, const std::vector<Dev> &devs, XrTime time) {
+  TrackingFrame f;
+  if (!time) { f.issue = "OpenXR clock conversion failed"; return f; }
+  std::set<uint32_t> origins;
+  bool unknown_station = false;
+  for (const auto &d : devs) {
+    if (!d.station) continue;
+    if (d.origin == UINT32_MAX) unknown_station = true;
+    else origins.insert(d.origin);
+  }
+  if (unknown_station) f.issue = "waiting for base station tracking origin metadata";
+  else if (origins.empty()) f.issue = "waiting for LHB- base station xdevs (requires the Monado base-station patch)";
+  else if (origins.size() != 1) f.issue = "base stations use multiple tracking origins: corrections held";
+  else f.origin = *origins.begin();
+  for (const auto &d : devs) {
+    if (d.hmd && d.origin == UINT32_MAX) {
+      f.origin = UINT32_MAX;
+      f.issue = "waiting for headset tracking origin metadata: corrections held";
+    }
+    if (d.hmd && d.origin == f.origin && f.origin != UINT32_MAX) {
+      f.origin = UINT32_MAX;
+      f.issue = "headset and base stations share a tracking origin: corrections held";
+    }
+  }
+  mnd_pose_t before{}, after{};
+  if (mnd.get_ref(mnd.root, MND_SPACE_REFERENCE_TYPE_STAGE, &before) != MND_SUCCESS || !Valid(FromMnd(before))) {
+    f.origin = UINT32_MAX;
+    f.issue = "cannot read the STAGE offset: corrections held";
+    return f;
+  }
+  const Rig stage = FromMnd(before);
+  if (f.origin != UINT32_MAX) {
+    if (mnd.get_origin(mnd.root, f.origin, &before) != MND_SUCCESS || !Valid(FromMnd(before))) {
+      f.origin = UINT32_MAX;
+      f.issue = "cannot read the Lighthouse origin offset: corrections held";
+    } else f.offset = FromMnd(before);
+  }
+  for (const auto &d : devs) {
+    if (!d.hmd && (!d.lighthouse || f.origin == UINT32_MAX || d.origin != f.origin)) continue;
+    Rig loc;
+    if (!Locate(xr, d, time, loc) || !Valid(loc)) continue;
+    Rig global = stage * loc;
+    if (!Valid(global)) continue;
+    if (d.hmd) { f.hmd = global; f.have_hmd = true; }
+    else {
+      Rig raw = Inv(f.offset) * global;
+      if (!Valid(raw)) continue;
+      if (d.station) f.stations[d.serial] = {raw.p, ToM3(raw.q)};
+      else f.bodies[(int)d.id] = raw.p;
+    }
+  }
+  bool stable = mnd.get_ref(mnd.root, MND_SPACE_REFERENCE_TYPE_STAGE, &after) == MND_SUCCESS &&
+                Valid(FromMnd(after)) && Same(stage, FromMnd(after));
+  if (f.origin != UINT32_MAX)
+    stable = stable && mnd.get_origin(mnd.root, f.origin, &after) == MND_SUCCESS &&
+             Valid(FromMnd(after)) && Same(f.offset, FromMnd(after));
+  if (!stable) {
+    f = TrackingFrame{};
+    f.issue = "space offsets changed during pose sampling: batch skipped";
+  }
+  return f;
+}
+
+static bool ApplyCorrection(Mnd &mnd, const TrackingFrame &frame, const Transform &x) {
+  if (!x.active || !frame.have_hmd || frame.stations.empty() || frame.origin == UINT32_MAX) return true;
+  Rig want{x.q, x.t};
+  // Compare against the live value, including after a runtime reconnect or
+  // another tool's edit. Neither STAGE nor any HMD origin is ever written.
+  if (!Valid(want) || norm(want.p) > 100 ||
+      (norm(want.p - frame.offset.p) <= 0.0002 && QuatDeg(want.q, frame.offset.q) <= 0.01)) return true;
+  mnd_pose_t mp = ToMnd(want);
+  return mnd.set_origin(mnd.root, frame.origin, &mp) == MND_SUCCESS;
+}
+
+// SteamVR's database is optional metadata only: it supplies rotor channels for
+// identity checks, never station positions or a fallback tracking frame.
 static std::string SteamConfigDir() {
   const char *x = getenv("XDG_CONFIG_HOME"), *h = getenv("HOME");
   std::string base = x && *x ? x : std::string(h ? h : ".") + "/.config";
@@ -373,55 +476,10 @@ static std::string SteamConfigDir() {
   return std::string(h ? h : ".") + "/.local/share/Steam/config";
 }
 
-static M3 Rxm(double a) {
-  M3 r;
-  double c = cos(a), s = sin(a);
-  r.m[1][1] = c; r.m[1][2] = -s; r.m[2][1] = s; r.m[2][2] = c;
-  return r;
-}
-static M3 Rzm(double a) {
-  M3 r;
-  double c = cos(a), s = sin(a);
-  r.m[0][0] = c; r.m[0][1] = -s; r.m[1][0] = s; r.m[1][1] = c;
-  return r;
-}
-
-static bool LoadStations(const std::string &path, Stations &out) {
+static bool LoadChannels(const std::string &path, std::map<std::string, int> &out) {
   JVal db;
   if (!JParse(Slurp(path), db)) return false;
-  const JVal *us = db.get("known_universes");
-  if (!us || us->t != JVal::Arr) return false;
-  const JVal *best = nullptr;
-  size_t best_n = 0;
-  double best_id = -1;
-  for (const JVal &u : us->a) {
-    const JVal *bs = u.get("base_stations");
-    if (!bs || bs->t != JVal::Arr) continue;
-    const JVal *id = u.get("id");
-    double idn = id ? (id->t == JVal::Str ? atof(id->s.c_str()) : id->num()) : 0;
-    if (bs->a.size() > best_n || (bs->a.size() == best_n && idn > best_id)) { best = &u; best_n = bs->a.size(); best_id = idn; }
-  }
-  if (!best) return false;
-  double pitch = 0, roll = 0;
-  if (const JVal *t = best->get("tilt")) {
-    if (const JVal *p = t->get("pitch")) pitch = p->num();
-    if (const JVal *r = t->get("roll")) roll = r->num();
-  }
-  M3 tilt = Rxm(-pitch) * Rzm(-roll);
-  out.raw.clear();
-  for (const JVal &b : best->get("base_stations")->a) {
-    const JVal *sn = b.get("base_serial_number"), *tp = b.get("target_pose");
-    if (!sn || !tp) continue;
-    const JVal *ts = tp->get("target_serial_number"), *pp = tp->get("pose");
-    std::vector<double> p = pp ? pp->nums() : std::vector<double>();
-    if (p.size() != 7 || (ts && ts->num() != 0)) continue;
-    M3 Ru = ToM3(Quat{p[3], p[0], p[1], p[2]});
-    V3 t{p[4], p[5], p[6]};
-    M3 Rs = T(Ru);                       // station's orientation in the universe
-    V3 ps = (Rs * t) * -1.0;             // and its position: -R^T t
-    out.raw[Fmt("LHB-%08X", (unsigned)sn->num())] = {tilt * ps, tilt * Rs};
-  }
-  out.channel.clear();
+  out.clear();
   if (const JVal *bs = db.get("base_stations"))
     for (const JVal &b : bs->a) {
       const JVal *cfg = b.get("config"), *dyn = b.get("dynamic_states");
@@ -430,9 +488,9 @@ static bool LoadStations(const std::string &path, Stations &out) {
       for (const JVal &d : dyn->a)
         if (const JVal *st = d.get("dynamic_state"))
           if (const JVal *ch = st->get("sobChannel"))
-            if (ch->num() >= 1 && ch->num() <= 16) out.channel[Fmt("LHB-%08X", (unsigned)sn->num())] = (int)ch->num();
+            if (ch->num() >= 1 && ch->num() <= 16) out[Fmt("LHB-%08X", (unsigned)sn->num())] = (int)ch->num();
     }
-  return !out.raw.empty();
+  return true;
 }
 
 // ---------------------------------------------------------------- the runtime's manifest
@@ -507,19 +565,18 @@ static void Engine(const Options &o) {
   link.SetHosts(o.hosts);
   link.SetPreferred(o.preferred);
   link.SetFamily("");  // whichever headset answers: WiVRn names none of them
+  link.SetStreamer(wivrn ? "wivrn" : "monado");
+  sync.SetStreamer(wivrn ? "WiVRn" : "Monado");
   if (!dump) link.Start();
 
   Xr xr;
   std::vector<Dev> devs;
   std::map<uint32_t, std::string> origins;
-  uint64_t gen = 0;
-  Stations stations;
+  std::map<std::string, std::pair<V3, M3>> stations;
+  std::string input_issue, device_signature;
   time_t db_mtime = 0;
-  Rig stage_off{}, lh_off{};   // reference space Stage's offset, the lighthouse tracking origin's
-  std::set<uint32_t> lh_origins;
-  double next_connect = 0, last_tick = 0, last_db = 0, last_gen = 0, last_stage = 0, last_status = 0, last_dump = 0, last_pub = 0, last_ext = 0;
-  bool said_wait = false, applied_any = false, recording = false, paused_ = false;
-  Rig applied{};
+  double next_connect = 0, last_tick = 0, last_db = 0, last_gen = 0, last_status = 0, last_dump = 0, last_pub = 0;
+  bool said_wait = false, recording = false, paused_ = false;
   int cmd_seen = 0;
   std::string hmd_name;
   std::vector<std::string> pending_log;  // the page's log lines
@@ -568,7 +625,7 @@ static void Engine(const Options &o) {
     else if (ls == HeadsetLink::kSearching || ls == HeadsetLink::kIdle) state = QLHS_SEARCHING;
     else if (ls == HeadsetLink::kConnecting) state = QLHS_CONNECTING;
     else if (now - link.last_frame() > 3 && now - link.connected_at() > 5) state = QLHS_NO_CAMERAS;
-    else if (s.nstations < 2) state = QLHS_NO_STATIONS;
+    else if (stations.empty() || s.nstations < 2) state = QLHS_NO_STATIONS;
     else if (s.locked) state = QLHS_LOCKED;
     else state = QLHS_ACQUIRING;
     t.state = state;
@@ -654,12 +711,17 @@ static void Engine(const Options &o) {
       }
       said_wait = false;
       note("connected to the OpenXR runtime");
-      gen = ~0ull;
+      last_gen = 0;
     }
     if (!xr.Poll()) {
       note("the OpenXR session ended: reconnecting");
       for (auto &d : devs) d.space = XR_NULL_HANDLE;  // died with the session
       devs.clear();
+      origins.clear();
+      stations.clear();
+      sync.SetStationsRaw(stations);
+      device_signature.clear();
+      input_issue.clear();
       xr.Close();
       mnd.Disconnect();
       link.SetWanted(false);
@@ -668,44 +730,29 @@ static void Engine(const Options &o) {
     }
     if (!xr.running) { usleep(50000); continue; }
 
-    if (now - last_gen >= 1) {  // the device list changed (a tracker found, a controller off)
+    // Xdev lists and libmonado roots are snapshots; a list's generation may
+    // stay constant even after hotplug. Recreate both snapshots once a second.
+    now = QpcNow(); // xrCreateInstance may have waited a long time for a headset
+    if (now - last_gen >= 1) {
       last_gen = now;
-      uint64_t g = 0;
-      bool have = xr.list && XR_SUCCEEDED(xr.xrGetXDevListGenerationNumberMNDX(xr.list, &g));
-      if (!have || g != gen) {
-        if (Enumerate(xr, mnd, devs, origins)) {
-          if (xr.list) xr.xrGetXDevListGenerationNumberMNDX(xr.list, &gen);
-          lh_origins.clear();
-          for (auto &d : devs) {
-            Log(Fmt("device %s (%s): origin %s%s%s", d.name.c_str(), d.serial.c_str(),
-                    d.origin == UINT32_MAX ? "?" : origins[d.origin].c_str(), d.hmd ? ", the headset" : "",
-                    d.lighthouse ? ", lighthouse" : ""));
-            if (d.hmd) say("headset: " + d.name);
-            else if (d.lighthouse) say("lighthouse device " + d.serial);
-            if (d.lighthouse && d.origin != UINT32_MAX) lh_origins.insert(d.origin);
-          }
-          if (!lh_origins.empty()) {
-            uint32_t og = *lh_origins.begin();
-            mnd_pose_t cur;
-            if (mnd.get_origin(mnd.root, og, &cur) == MND_SUCCESS) lh_off = FromMnd(cur);
-          }
-        }
+      if (!Enumerate(xr, mnd, devs, origins)) {
+        last_gen = 0;
+        sync.SetStationsRaw({});
+        link.SetWanted(false);
+        usleep(100000);
+        continue;
       }
-    }
-    if (now - last_stage >= 0.25) {
-      last_stage = now;
-      mnd_pose_t s;
-      if (mnd.get_ref(mnd.root, MND_SPACE_REFERENCE_TYPE_STAGE, &s) == MND_SUCCESS) stage_off = FromMnd(s);
-      if (!lh_origins.empty() && mnd.get_origin(mnd.root, *lh_origins.begin(), &s) == MND_SUCCESS) {
-        Rig cur = FromMnd(s);  // the live offset: something else (motoc, a profile script) may have set it
-        double dp = norm(cur.p - lh_off.p), da = QuatDeg(cur.q, lh_off.q);
-        if (applied_any && (dp > 0.0005 || da > 0.05) && now - last_ext >= 5) {
-          last_ext = now;
-          Log(Fmt("the lighthouse tracking origin's offset was changed by something else (%.1f cm, %.2f deg): rewriting ours",
-                  dp * 100, da));
+      std::string signature;
+      for (const auto &d : devs) signature += d.serial + ":" + d.name + ":" + std::to_string(d.origin) + ";";
+      if (signature != device_signature) {
+        device_signature = signature;
+        for (const auto &d : devs) {
+          Log(Fmt("device %s (%s): origin %s%s%s", d.name.c_str(), d.serial.c_str(),
+                  d.origin == UINT32_MAX ? "?" : origins[d.origin].c_str(), d.hmd ? ", the headset" : "",
+                  d.station ? ", base station" : d.lighthouse ? ", lighthouse" : ""));
+          if (d.hmd) { say("headset: " + d.name); link.SetFamily(QuestFamily(d.name)); }
+          else if (d.station) say("base station " + d.serial);
         }
-        lh_off = cur;  // raw poses are divided by what is really applied; the next tick rewrites ours if it differs
-        if (applied_any && (dp > 0.0005 || da > 0.05)) applied = cur;
       }
     }
     if (now - last_db >= 2) {
@@ -714,58 +761,47 @@ static void Engine(const Options &o) {
       struct stat sb;
       if (stat(path.c_str(), &sb) == 0 && sb.st_mtime != db_mtime) {  // SteamVR's lighthouse driver rewrites it as it learns
         db_mtime = sb.st_mtime;
-        Stations st;
-        if (LoadStations(path, st)) {
-          stations = st;
-          sync.SetStationsRaw(stations.raw);
-          sync.SetChannels(stations.channel);
-          note(Fmt("%zu base stations from lighthousedb.json", stations.raw.size()));
-        }
+        std::map<std::string, int> channels;
+        if (LoadChannels(path, channels)) sync.SetChannels(channels);
       }
     }
 
-    // poses at this moment
-    XrTime xt = xr.Now();
-    bool have_hmd = false;
-    for (auto &d : devs) {
-      if (!d.hmd && !d.lighthouse) continue;
-      Rig loc;
-      if (!Locate(xr, d, xt, loc)) continue;
-      Rig g = stage_off * loc;  // in Monado's global space
-      int idx = (int)d.id;
-      if (d.hmd) {
-        have_hmd = true;
-        if (!dump) sync.OnHmdPose(now, g.q, g.p);
-      } else {
-        Rig raw = Inv(lh_off) * g;  // the lighthouse driver's own frame, whatever offset is applied now
-        if (!dump) sync.OnBodyPose(idx, now, raw.p);
-        if (dump && now - last_dump >= 1)
-          Log(Fmt("  %s raw %.3f %.3f %.3f", d.serial.c_str(), raw.p.x, raw.p.y, raw.p.z));
-      }
-      if (dump && d.hmd && now - last_dump >= 1) Log(Fmt("  HMD %.3f %.3f %.3f", g.p.x, g.p.y, g.p.z));
+    double pose_time = 0;
+    XrTime xt = xr.Now(pose_time);
+    TrackingFrame frame = ReadTrackingFrame(xr, mnd, devs, xt);
+    if (frame.issue != input_issue) {
+      input_issue = frame.issue;
+      if (!input_issue.empty()) note(input_issue);
+    }
+    if (frame.stations.size() != stations.size())
+      note(Fmt("%zu valid base stations from OpenXR", frame.stations.size()));
+    stations = frame.stations; // invalid/disconnected stations are removed, never retained as live inputs
+    if (!dump) {
+      sync.SetStationsRaw(stations);
+      if (frame.have_hmd) sync.OnHmdPose(pose_time, frame.hmd.q, frame.hmd.p);
+      for (const auto &body : frame.bodies) sync.OnBodyPose(body.first, pose_time, body.second);
     }
     if (dump) {
-      if (now - last_dump >= 1) last_dump = now;
+      if (now - last_dump >= 1) {
+        last_dump = now;
+        if (frame.have_hmd) Log(Fmt("  HMD %.3f %.3f %.3f", frame.hmd.p.x, frame.hmd.p.y, frame.hmd.p.z));
+        for (const auto &station : stations)
+          Log(Fmt("  %s raw %.3f %.3f %.3f", station.first.c_str(), station.second.first.x,
+                  station.second.first.y, station.second.first.z));
+        for (const auto &body : frame.bodies)
+          Log(Fmt("  device %d raw %.3f %.3f %.3f", body.first, body.second.x, body.second.y, body.second.z));
+      }
       usleep(8000);
       continue;
     }
-    link.SetWanted(have_hmd);
+    // A skipped sample during a recenter must not tear down the independent
+    // camera connection. As with the SteamVR driver, an eligible HMD suffices.
+    link.SetWanted(std::any_of(devs.begin(), devs.end(), [](const Dev &d) { return d.hmd; }));
 
-    if (now - last_tick >= 0.05) {  // 20 Hz, as the driver
+    if (now - last_tick >= 0.05) {
       last_tick = now;
       Transform x = sync.Tick(now);
-      if (x.active && !lh_origins.empty()) {
-        Rig want{x.q, x.t};
-        bool far = norm(want.p) > 100;  // an anomaly: not worth applying
-        double dp = norm(want.p - applied.p), da = QuatDeg(want.q, applied.q);
-        if (!far && (!applied_any || dp > 0.0002 || da > 0.01)) {
-          bool ok = true;
-          mnd_pose_t mp = ToMnd(want);
-          for (uint32_t og : lh_origins) ok = mnd.set_origin(mnd.root, og, &mp) == MND_SUCCESS && ok;
-          if (ok) { applied = want; lh_off = want; applied_any = true; }
-          else Log("couldn't set the lighthouse tracking origin's offset");
-        }
-      }
+      if (!ApplyCorrection(mnd, frame, x)) Log("couldn't set the Lighthouse tracking origin's offset");
     }
     if (now - last_status >= 15) {
       last_status = now;

@@ -171,18 +171,36 @@ patches nothing on disk. On the Frame, `lhsyncd` logs to the user journal
 
 WiVRn and Monado have no SteamVR host to hook, so `questlhsync-xr` is a desktop app that does the same job from
 outside: it shows the same dashboard page in a window, uses the same headset link and solver, reads the headset's and
-the lighthouse devices' poses over OpenXR (`XR_MNDX_xdev_space`, a headless session, as `motoc` does) and the base
-stations from SteamVR's `lighthousedb.json`, and applies the result as the lighthouse devices' tracking origin offset
-through libmonado. It needs WiVRn or Monado 25.0 or newer with SteamVR tracked devices enabled (not the WiVRn
+the lighthouse devices' poses over OpenXR (`XR_MNDX_xdev_space`, a headless session, as `motoc` does), including live
+base station poses. It applies the result as the Lighthouse tracking origin offset through libmonado. It needs
+WiVRn or Monado 25.0 or newer **with the base-station xdev patch**, SteamVR tracked devices enabled (not the WiVRn
 Flatpak, which can't use the lighthouse driver), SteamVR installed (not required to be running), and the OpenXR loader.
 Both the loader and libmonado are found at runtime: libmonado from the active runtime manifest's `MND_libmonado_path`.
 
+The patched `steamvr_lh` must expose stations with their original `LHB-...` serials and
+`XRT_INPUT_GENERIC_TRACKER_POSE` in the same tracking origin as the `LHR-...` devices. With the companion WiVRn
+patch this is on by default; do not set `LH_EXPOSE_BASE_STATIONS=0`. Use the companion xrizer patch to exclude
+these stations from game-facing body trackers. The headset's existing QuestLHSync module is unchanged.
+
+Station positions and orientations come only from OpenXR. `lighthousedb.json` is optional and supplies rotor
+channels for identity checks; without it those channel checks are unavailable. The app reads STAGE and Lighthouse
+origin offsets to recover uncorrected station/tracker poses, and writes only the Lighthouse origin. User reference
+space offsets are left under the user's control. If offset reads fail or change during a pose batch, that batch is
+skipped. Stations in different origins, or an HMD sharing the Lighthouse origin, hold corrections rather than mixing
+unrelated frames or moving the HMD.
+
 `./build.sh --wivrn` builds `out/questlhsync-xr` and packs it, SDL2 and a font into
-`out/QuestLHSync-wivrn.AppImage`. Start lighthouse devices before the headset connects (WiVRn discovers them
-once), start the app, then connect the headset: the app waits for it. The page's buttons pause the corrections and
+`out/QuestLHSync-wivrn.AppImage`. Start the app, then connect the headset: the app waits for it. Device and origin
+snapshots refresh once a second, including devices added after connection when the runtime supports hotplug.
+The page's buttons pause the corrections and
 record a session. `--host IP` and `--headset SERIAL` as in the driver's settings; `--no-window` runs without the
-window; `--dump` lists the devices, their tracking origins and poses without solving. State and the log are in
+window; `--dump` lists the devices, their tracking origins and raw `LHB-` poses without solving or applying corrections.
+If no stations appear, check that the runtime includes the base-station patch. State and the log are in
 `~/.local/share/QuestLHSync` (`questlhsync-xr.log`). No base station averaging or gravity levelling yet.
+
+`sh scripts/test_xr.sh` runs hardware-free tests of coordinate conversion, live station discovery, tracking loss,
+reconnect offset application and reference-space changes. It requires a C++17 compiler, SDL2 development files and
+pkg-config. Real camera timing and calibration accuracy still require an HMD and base stations.
 
 ## Uninstall
 
