@@ -12,7 +12,7 @@
 #define QLHS_SHM_FILE "status.shm"
 #define QLHS_OVERLAY_LOCK "overlay.lock"
 #define QLHS_VERSION 2
-#define QLHS_RELEASE "1.24"  // magisk/build_module.py reads it
+#define QLHS_RELEASE "1.28"  // magisk/build_module.py reads it
 
 enum QlhsState : int32_t {
   QLHS_STARTING = 0,
