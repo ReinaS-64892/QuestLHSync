@@ -1,6 +1,6 @@
 // QuestLHSync's link to the headset's lhsyncd (Quest: Magisk module, Frame: user service): UDP discovery, then one TCP
 // stream per session.
-//   discovery  UDP 47281: "QLHS?" (broadcast + configured hosts) -> "QLHS 1 <serial> <tcp port> <model>"
+//   discovery  UDP 47281: "QLHS?" (broadcast only when no hosts are configured) -> "QLHS 1 <serial> <tcp port> <model>"
 //   stream     TCP 47280: "H ..." hello, "C <len> <name>" + the camera calibration, then lhsight's lines
 //              (F frames, T heartbeats, I/W/E messages); "P <seq> <pc_ns>" -> "Q <seq> <pc_ns> <mono_ns>" round trips
 #pragma once
@@ -27,7 +27,7 @@ class HeadsetLink {
   void Start();
   void Stop();
   void SetWanted(bool w) { wanted_ = w; }             // an eligible HMD is in SteamVR
-  void SetHosts(const std::vector<std::string> &h);   // manual addresses (settings): asked and tried over TCP too
+  void SetHosts(const std::vector<std::string> &h);   // explicit TCP addresses only; disables discovery and memory fallback
   void SetPreferred(const std::string &serial);       // pick this headset when several answer
   void SetFamily(const std::string &family);          // SteamVR's HMD (QuestFamily): skip other kinds of headset
   void SetStreamer(const std::string &driver);        // SteamVR's streamer: with several headsets, the one last used
@@ -43,6 +43,7 @@ class HeadsetLink {
   double connected_at() const { return connected_at_; }
 
  private:
+  friend struct HeadsetLinkTest;
   struct Found { std::string ip, serial, model; int port; };
   Sync *sync_;
   LogFn log_;
@@ -59,6 +60,7 @@ class HeadsetLink {
   std::set<std::string> quiet_ips_;  // ... and of ones that sent no camera frames while others might (tried last)
   std::set<std::string> answered_;   // ... and of those of SteamVR's kind that answered the last discovery
 
+  std::vector<Found> Candidates(const std::vector<Found> &found);
   void Loop();
   int Rank(const std::string &ip, const std::string &id) const;  // m_ held; less is better
   void Remember(const Known &k);  // m_ held

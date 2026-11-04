@@ -197,10 +197,13 @@ int HeadsetLink::Rank(const std::string &ip, const std::string &id) const {
 }
 
 bool HeadsetLink::Others(const std::string &ip) const {
+  if (!hosts_.empty()) {
+    for (const auto &h : hosts_)
+      if (h != ip && !wrong_ips_.count(h)) return true;
+    return false;
+  }
   for (auto &a : answered_)
     if (a != ip && !wrong_ips_.count(a)) return true;
-  for (auto &h : hosts_)
-    if (h != ip && !wrong_ips_.count(h)) return true;
   for (auto &k : known_)
     if (k.ip != ip && !wrong_ips_.count(k.ip) && Fits(family_, k.model)) return true;
   return false;
@@ -208,6 +211,41 @@ bool HeadsetLink::Others(const std::string &ip) const {
 
 static void Sleep_(std::atomic<bool> &run, int ms) {
   for (int i = 0; i < ms / 50 && run; i++) Sleep(50);
+}
+
+std::vector<HeadsetLink::Found> HeadsetLink::Candidates(const std::vector<Found> &found) {
+  std::vector<std::pair<int, Found>> cand;
+  std::string fam;
+  {
+    std::lock_guard<std::mutex> g(m_);
+    fam = family_;
+    answered_.clear();
+    // Explicit hosts are an allowlist, including when unreachable or quiet.
+    // Never fall back to a different headset found by discovery or memory.
+    if (!hosts_.empty()) {
+      std::vector<Found> result;
+      for (const auto &h : hosts_)
+        if (!wrong_ips_.count(h)) result.push_back({h, "", "", kTcpPort});
+      return result;
+    }
+    auto listed = [&](const std::string &ip) {
+      for (auto &c : cand)
+        if (c.second.ip == ip) return true;
+      return false;
+    };
+    for (auto &f : found)
+      if (Fits(fam, f.model)) {
+        cand.push_back({2 * Rank(f.ip, HeadsetId(f.serial)), f});
+        answered_.insert(f.ip);
+      }
+    for (auto &k : known_)
+      if (Fits(fam, k.model) && !wrong_ips_.count(k.ip) && !listed(k.ip))
+        cand.push_back({2 * Rank(k.ip, k.id) + 1, {k.ip, "", "", kTcpPort}});
+  }
+  std::stable_sort(cand.begin(), cand.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
+  std::vector<Found> result;
+  for (const auto &c : cand) result.push_back(c.second);
+  return result;
 }
 
 void HeadsetLink::Loop() {
@@ -221,46 +259,21 @@ void HeadsetLink::Loop() {
     state_ = kSearching;
     std::vector<Found> found;
     Discover(found);
-    // what to try, in turn until one talks, by Rank: the headsets that answered and can be SteamVR's, and straight
-    // over TCP the manual hosts (a firewall eating UDP; ahead of headsets new to the memory) and the headsets remembered
-    // (a network dropping broadcasts), each after one that answered at the same rank
-    std::vector<std::pair<int, Found>> cand;
+    // Explicit hosts only, or ranked discovery and remembered addresses.
+    auto cand = Candidates(found);
     std::string fam;
-    {
-      std::lock_guard<std::mutex> g(m_);
-      fam = family_;
-      auto listed = [&](const std::string &ip) {
-        for (auto &c : cand)
-          if (c.second.ip == ip) return true;
-        return false;
-      };
-      answered_.clear();
-      for (auto &f : found)
-        if (Fits(fam, f.model)) {
-          cand.push_back({2 * Rank(f.ip, HeadsetId(f.serial)), f});
-          answered_.insert(f.ip);
-        }
-      for (auto &h : hosts_)
-        if (!wrong_ips_.count(h) && !listed(h)) {
-          int r = Rank(h, "");
-          if (r % 1000 == 300) r -= 50;  // not remembered: still ahead of new headsets that answered
-          cand.push_back({2 * r + 1, {h, "", "", kTcpPort}});
-        }
-      for (auto &k : known_)
-        if (Fits(fam, k.model) && !wrong_ips_.count(k.ip) && !listed(k.ip))
-          cand.push_back({2 * Rank(k.ip, k.id) + 1, {k.ip, "", "", kTcpPort}});
-    }
-    std::stable_sort(cand.begin(), cand.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
+    bool manual;
+    { std::lock_guard<std::mutex> g(m_); fam = family_; manual = !hosts_.empty(); }
     bool fitting = false;
     for (auto &f : found) fitting = fitting || Fits(fam, f.model);
     if (!fitting && !found.empty() && skipped_ != found[0].serial) {  // once per headset, not every round
       skipped_ = found[0].serial;
       log_(found[0].model + " at " + found[0].ip + " answers, but SteamVR's headset is a " + fam + ": not used");
     }
-    if (found.empty() && quiet++ % 30 == 0)
+    if (!manual && found.empty() && quiet++ % 30 == 0)
       log_("no QuestLHSync headset answers on the network (is it awake, with lhsyncd installed?)");
     for (auto &c : cand)
-      if (run_ && wanted_ && Session(c.second)) {
+      if (run_ && wanted_ && Session(c)) {
         quiet = 0;
         break;
       }
@@ -318,6 +331,7 @@ static std::vector<sockaddr_in> Broadcasts() {
 }
 
 bool HeadsetLink::Discover(std::vector<Found> &out) {
+  { std::lock_guard<std::mutex> g(m_); if (!hosts_.empty()) return false; }
   SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
   if (s == INVALID_SOCKET) return false;
   BOOL on = TRUE;
@@ -331,22 +345,6 @@ bool HeadsetLink::Discover(std::vector<Found> &out) {
   all.sin_port = htons(kUdpPort);
   all.sin_addr.s_addr = INADDR_BROADCAST;
   dst.push_back(all);
-  std::vector<std::string> hosts;
-  {
-    std::lock_guard<std::mutex> g(m_);
-    hosts = hosts_;
-  }
-  for (auto &h : hosts) {
-    addrinfo hint{}, *res = nullptr;
-    hint.ai_family = AF_INET;
-    hint.ai_socktype = SOCK_DGRAM;
-    if (getaddrinfo(h.c_str(), nullptr, &hint, &res) == 0 && res) {
-      sockaddr_in a = *(sockaddr_in *)res->ai_addr;
-      a.sin_port = htons(kUdpPort);
-      dst.push_back(a);
-      freeaddrinfo(res);
-    }
-  }
   const char q[] = "QLHS?";
   for (int round = 0; round < 2; round++)
     for (auto &d : dst) sendto(s, q, (int)strlen(q), 0, (sockaddr *)&d, sizeof d);

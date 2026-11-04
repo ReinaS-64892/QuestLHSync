@@ -951,6 +951,7 @@ int main(int argc, char **argv) {
     else if (a == "--runtime") o.runtime = val();
     else {
       printf("usage: %s [--host IP[,IP]] [--headset SERIAL] [--runtime manifest.json] [--no-window] [--dump] [--icon out.png]\n", argv[0]);
+      printf("  --host: connect only to these addresses, in order; disables automatic discovery and address-memory fallback.\n");
       return a == "--help" ? 0 : 2;
     }
   }

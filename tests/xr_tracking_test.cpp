@@ -7,6 +7,41 @@
 #include <cassert>
 #include <limits>
 
+// Exercise the production candidate selection with two identical HMD models.
+struct HeadsetLinkTest {
+  static void Run() {
+    HeadsetLink link(nullptr, [](const std::string &) {}, [](double, const std::string &) {});
+    link.SetFamily("Steam Frame");
+    link.SetPreferred("other-frame");
+    link.SetStreamer("WiVRn");
+    link.known_ = {{"192.0.2.2", "", "Steam Frame", "WiVRn"}};
+    std::vector<HeadsetLink::Found> replies{
+        {"192.0.2.2", "other-frame", "Steam Frame", 47280},
+        {"192.0.2.3", "third-frame", "Steam Frame", 47280}};
+    link.SetHosts({"127.0.0.1"});
+    link.quiet_ips_.insert("127.0.0.1");
+    auto candidates = link.Candidates(replies);
+    assert(candidates.size() == 1 && candidates[0].ip == "127.0.0.1");
+    assert(candidates[0].port == 47280);
+    assert(!link.Others("127.0.0.1"));
+    std::vector<HeadsetLink::Found> found;
+    assert(!link.Discover(found) && found.empty()); // No broadcast with explicit hosts.
+    link.wrong_ips_.insert("127.0.0.1");
+    assert(link.Candidates(replies).empty()); // Rejection cannot fall back to another Frame.
+    link.wrong_ips_.clear();
+    link.SetHosts({"frame.local", "127.0.0.1"});
+    candidates = link.Candidates(replies);
+    assert(candidates.size() == 2);
+    assert(candidates[0].ip == "frame.local" && candidates[1].ip == "127.0.0.1");
+    assert(link.Others("127.0.0.1"));
+    link.SetHosts({});
+    candidates = link.Candidates(replies);
+    assert(candidates.size() == 2); // Auto discovery is restored when hosts are cleared.
+    assert(candidates[0].ip == "192.0.2.2");
+    assert(link.Others("192.0.2.2"));
+  }
+};
+
 namespace {
 Rig stage, offset, head;
 std::map<XrSpace, Rig> raw;
@@ -237,6 +272,7 @@ void EnumerationTests() {
 } // namespace
 
 int main() {
+  HeadsetLinkTest::Run();
   TrackingTests();
   EnumerationTests();
   puts("OpenXR tracking tests passed");

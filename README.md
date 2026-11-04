@@ -133,7 +133,7 @@ Optional, in `steamvr.vrsettings` under `"driver_questlhsync"`:
 | Key | Default | |
 |---|---|---|
 | `enable` | `true` | `false` turns QuestLHSync off |
-| `host` | `""` | The headset's IP address(es), comma-separated, for networks that drop broadcasts |
+| `host` | `""` | Only connect to these IP addresses or hostnames, comma-separated; disables discovery and remembered-address fallback |
 | `headset` | `""` | A headset serial to prefer when several answer |
 | `anyHmd` | `false` | Use SteamVR's headset even when it isn't named a Quest Pro, 3, 3S or Steam Frame |
 | `record` | `false` | Record every session (same as the button) |
@@ -193,7 +193,10 @@ unrelated frames or moving the HMD.
 `out/QuestLHSync-wivrn.AppImage`. Start the app, then connect the headset: the app waits for it. Device and origin
 snapshots refresh once a second, including devices added after connection when the runtime supports hotplug.
 The page's buttons pause the corrections and
-record a session. `--host IP` and `--headset SERIAL` as in the driver's settings; `--no-window` runs without the
+record a session. `--host IP` connects only to the specified address; comma-separated addresses are tried in order.
+It disables automatic discovery and remembered-address fallback, so an unavailable host never selects another headset.
+For WiVRn TCP port forwarding, use `--host 127.0.0.1`. Without `--host`, automatic discovery works as before.
+`--headset SERIAL` prefers a headset as in the driver's settings; `--no-window` runs without the
 window; `--dump` lists the devices, their tracking origins and raw `LHB-` poses without solving or applying corrections.
 If no stations appear, check that the runtime includes the base-station patch. State and the log are in
 `~/.local/share/QuestLHSync` (`questlhsync-xr.log`). No base station averaging or gravity levelling yet.
