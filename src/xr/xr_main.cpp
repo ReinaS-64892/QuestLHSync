@@ -494,14 +494,61 @@ static bool LoadChannels(const std::string &path, std::map<std::string, int> &ou
 }
 
 // ---------------------------------------------------------------- the runtime's manifest
+static std::string ReadableManifest(const std::string &path) {
+  if (access(path.c_str(), R_OK) != 0) return "";
+  char resolved[4096];
+  return realpath(path.c_str(), resolved) ? resolved : path;
+}
+
+// A source build can be used before WiVRn registers a system runtime (normally
+// on headset connection). Locate its existing build manifest beside this repo;
+// do not create another manifest or change the user's global registration.
+static std::string WorkspaceManifest(std::string executable) {
+  auto slash = executable.rfind('/');
+  if (slash == std::string::npos) return "";
+  std::string dir = executable.substr(0, slash);
+  for (int depth = 0; depth < 4 && !dir.empty(); depth++) {
+    std::string path = ReadableManifest(dir + "/WiVRn/build-lh-sync/openxr_wivrn-dev.json");
+    if (!path.empty()) return path;
+    slash = dir.rfind('/');
+    if (slash == std::string::npos) break;
+    dir.resize(slash);
+  }
+  return "";
+}
+
 static std::string ManifestPath(const std::string &given) {
   if (!given.empty()) return given;
-  if (const char *e = getenv("XR_RUNTIME_JSON")) return e;
+  if (const char *e = getenv("XR_RUNTIME_JSON"); e && *e) return e;
   const char *x = getenv("XDG_CONFIG_HOME"), *h = getenv("HOME");
-  std::string base = x && *x ? x : std::string(h ? h : ".") + "/.config";
-  for (std::string p : {base + "/openxr/1/active_runtime.json", std::string("/etc/xdg/openxr/1/active_runtime.json"),
-                        std::string("/usr/share/openxr/1/openxr_wivrn.json"), std::string("/usr/share/openxr/1/openxr_monado.json")})
-    if (access(p.c_str(), R_OK) == 0) return p;
+  std::vector<std::string> dirs{x && *x ? x : std::string(h ? h : ".") + "/.config"};
+  const char *config_dirs = getenv("XDG_CONFIG_DIRS");
+  std::stringstream search(config_dirs && *config_dirs ? config_dirs : "/etc/xdg");
+  std::string dir;
+  while (std::getline(search, dir, ':')) if (!dir.empty()) dirs.push_back(dir);
+  dirs.push_back("/etc");
+  std::vector<std::string> active_names;
+#if defined(__x86_64__)
+  active_names.push_back("active_runtime.x86_64.json");
+#elif defined(__aarch64__)
+  active_names.push_back("active_runtime.aarch64.json");
+#endif
+  active_names.push_back("active_runtime.json");
+  for (const auto &base : dirs)
+    for (const auto &name : active_names) {
+      std::string path = ReadableManifest(base + "/openxr/1/" + name);
+      if (!path.empty()) return path;
+    }
+  char executable[4096];
+  ssize_t n = readlink("/proc/self/exe", executable, sizeof(executable) - 1);
+  if (n > 0) {
+    std::string path = WorkspaceManifest(std::string(executable, n));
+    if (!path.empty()) return path;
+  }
+  for (const auto &name : {"openxr_wivrn.json", "openxr_monado.json"}) {
+    std::string path = ReadableManifest(std::string("/usr/share/openxr/1/") + name);
+    if (!path.empty()) return path;
+  }
   return "";
 }
 
@@ -547,14 +594,18 @@ static void Engine(const Options &o) {
   const bool dump = o.dump;
   std::string dir = QlhsDataDir();
   std::string manifest = ManifestPath(o.runtime);
-  if (!getenv("XR_RUNTIME_JSON") && !manifest.empty()) setenv("XR_RUNTIME_JSON", manifest.c_str(), 0);
+  // --runtime must override an inherited XR_RUNTIME_JSON for BOTH libraries.
+  if (!manifest.empty()) setenv("XR_RUNTIME_JSON", manifest.c_str(), 1);
   std::string monado_path = LibMonadoPath(manifest);
   Log("QuestLHSync " QLHS_RELEASE " for WiVRn/Monado: runtime " + (manifest.empty() ? std::string("(loader's choice)") : manifest) +
       ", libmonado " + monado_path);
   bool wivrn = manifest.find("wivrn") != std::string::npos || monado_path.find("wivrn") != std::string::npos;
 
   Mnd mnd;
-  if (!mnd.Open(monado_path)) { g_rc = 1; g_quit = true; g_engine_done = true; return; }
+  if (!mnd.Open(monado_path)) {
+    Log("select the WiVRn/Monado manifest with --runtime /path/to/openxr_wivrn-dev.json if it is not registered");
+    g_rc = 1; g_quit = true; g_engine_done = true; return;
+  }
 
   SyncConfig cfg;
   cfg.dir = dir;
