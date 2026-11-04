@@ -176,14 +176,6 @@ base station poses. It applies the result as the Lighthouse tracking origin offs
 WiVRn or Monado 25.0 or newer **with the base-station xdev patch**, SteamVR tracked devices enabled (not the WiVRn
 Flatpak, which can't use the lighthouse driver), SteamVR installed (not required to be running), and the OpenXR loader.
 Both the loader and libmonado are found at runtime: libmonado from the active runtime manifest's `MND_libmonado_path`.
-`--runtime FILE` takes precedence over `XR_RUNTIME_JSON`. With neither an explicit runtime nor an active runtime
-registration, a source build in this workspace also looks for the sibling
-`WiVRn/build-lh-sync/openxr_wivrn-dev.json`. This uses WiVRn's existing build manifest without generating another
-one or changing system settings. For other layouts, pass that manifest explicitly:
-
-```sh
-./QuestLHSync/out/questlhsync-xr --runtime "$PWD/WiVRn/build-lh-sync/openxr_wivrn-dev.json" --dump
-```
 
 The patched `steamvr_lh` must expose stations with their original `LHB-...` serials and
 `XRT_INPUT_GENERIC_TRACKER_POSE` in the same tracking origin as the `LHR-...` devices. With the companion WiVRn

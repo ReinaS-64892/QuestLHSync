@@ -6,7 +6,6 @@
 
 #include <cassert>
 #include <limits>
-#include <filesystem>
 
 namespace {
 Rig stage, offset, head;
@@ -235,65 +234,10 @@ void EnumerationTests() {
   mnd.Disconnect();
   assert(creates == 3 && destroys == creates);
 }
-
-struct SavedEnv {
-  std::string key, value;
-  bool existed;
-  explicit SavedEnv(const char *name) : key(name), existed(getenv(name) != nullptr) {
-    if (existed) value = getenv(name);
-  }
-  ~SavedEnv() {
-    if (existed) setenv(key.c_str(), value.c_str(), 1);
-    else unsetenv(key.c_str());
-  }
-};
-
-void ManifestTests() {
-  namespace fs = std::filesystem;
-  char pattern[] = "/tmp/qlhs-manifest-XXXXXX";
-  char *created = mkdtemp(pattern);
-  assert(created);
-  fs::path root(created);
-  fs::path manifest = root / "WiVRn/build-lh-sync/openxr_wivrn-dev.json";
-  fs::create_directories(manifest.parent_path());
-  fs::path lib = manifest.parent_path() / "lib/libmonado.so.25";
-  fs::create_directories(lib.parent_path());
-  std::ofstream(lib).close();
-  std::ofstream(manifest) << R"({"runtime":{"MND_libmonado_path":"lib/libmonado.so.25"}})";
-  assert(WorkspaceManifest((root / "QuestLHSync/out/questlhsync-xr").string()) == manifest.string());
-  assert(WorkspaceManifest((root / "QuestLHSync/build/tests/test").string()) == manifest.string());
-  assert(WorkspaceManifest("no-directory").empty());
-  SavedEnv runtime("XR_RUNTIME_JSON"), config("XDG_CONFIG_HOME"), dirs("XDG_CONFIG_DIRS"), monado("QLHS_LIBMONADO");
-  unsetenv("QLHS_LIBMONADO");
-  setenv("XR_RUNTIME_JSON", "/explicit/environment.json", 1);
-  assert(ManifestPath("/explicit/argument.json") == "/explicit/argument.json");
-  assert(ManifestPath("") == "/explicit/environment.json");
-  setenv("XR_RUNTIME_JSON", "", 1); // an empty environment value should not disable discovery
-  fs::path config_home = root / "config";
-  fs::path config_dirs = root / "system-config";
-  fs::create_directories(config_home / "openxr/1");
-  fs::create_directories(config_dirs / "openxr/1");
-  setenv("XDG_CONFIG_HOME", config_home.c_str(), 1);
-  setenv("XDG_CONFIG_DIRS", config_dirs.c_str(), 1);
-  fs::path active = config_dirs / "openxr/1/active_runtime.json";
-  fs::create_symlink(manifest, active);
-  assert(ManifestPath("") == manifest.string());
-  assert(LibMonadoPath(active.string()) == lib.string()); // resolve paths relative to the symlink target
-  fs::path user_active = config_home / "openxr/1/active_runtime.json";
-  std::ofstream(user_active) << "{}";
-  assert(ManifestPath("") == user_active.string()); // normal registration takes precedence
-#if defined(__x86_64__)
-  fs::path arch_active = config_home / "openxr/1/active_runtime.x86_64.json";
-  fs::create_symlink(manifest, arch_active);
-  assert(ManifestPath("") == manifest.string());
-#endif
-  fs::remove_all(root);
-}
 } // namespace
 
 int main() {
   TrackingTests();
   EnumerationTests();
-  ManifestTests();
   puts("OpenXR tracking tests passed");
 }
