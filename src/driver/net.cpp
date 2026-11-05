@@ -14,6 +14,7 @@ typedef u_long NbArg;
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <netdb.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/ioctl.h>
@@ -330,6 +331,22 @@ static std::vector<sockaddr_in> Broadcasts() {
   return out;
 }
 
+// select's fd_set is limited to FD_SETSIZE on Unix. libmonado or another
+// component can leave us with a larger socket descriptor, especially on reconnect.
+static int WaitSocket(SOCKET s, bool writing, int timeout_ms) {
+#ifdef _WIN32
+  fd_set ready, errors;
+  FD_ZERO(&ready); FD_SET(s, &ready);
+  FD_ZERO(&errors); FD_SET(s, &errors);
+  timeval timeout{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+  return select(0, writing ? nullptr : &ready, writing ? &ready : nullptr, &errors, &timeout);
+#else
+  pollfd p{s, short(writing ? POLLOUT : POLLIN), 0};
+  int r = poll(&p, 1, timeout_ms);
+  return r > 0 && (p.revents & POLLNVAL) ? -1 : r;
+#endif
+}
+
 bool HeadsetLink::Discover(std::vector<Found> &out) {
   { std::lock_guard<std::mutex> g(m_); if (!hosts_.empty()) return false; }
   SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -353,11 +370,7 @@ bool HeadsetLink::Discover(std::vector<Found> &out) {
   for (;;) {
     double left = until - QpcNow();
     if (left <= 0) break;
-    fd_set rf;
-    FD_ZERO(&rf);
-    FD_SET(s, &rf);
-    timeval tv{0, (long)(left * 1e6)};
-    if (select((int)s + 1, &rf, nullptr, nullptr, &tv) <= 0) break;
+    if (WaitSocket(s, false, (int)(left * 1000) + 1) <= 0) break;
     char buf[512];
     sockaddr_in from{};
     socklen_t fl = sizeof from;
@@ -396,19 +409,16 @@ bool HeadsetLink::Session(const Found &f) {
   snprintf(port, sizeof port, "%d", f.port);
   if (getaddrinfo(f.ip.c_str(), port, &hint, &res) != 0 || !res) return false;
   SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (s == INVALID_SOCKET) { freeaddrinfo(res); return false; }
   NbArg nb = 1;
   ioctlsocket(s, FIONBIO, &nb);
   connect(s, res->ai_addr, (int)res->ai_addrlen);
   freeaddrinfo(res);
-  fd_set wf, ef;
-  FD_ZERO(&wf); FD_SET(s, &wf);
-  FD_ZERO(&ef); FD_SET(s, &ef);
-  timeval tv{3, 0};
-  int sel = select((int)s + 1, nullptr, &wf, &ef, &tv);
+  int sel = WaitSocket(s, true, 3000);
   int soerr = 0;  // a refused or unreachable connect makes the socket writable too, with its error here
   socklen_t sl = sizeof soerr;
-  getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&soerr, &sl);
-  if (sel <= 0 || FD_ISSET(s, &ef) || soerr) {
+  int err_result = getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&soerr, &sl);
+  if (sel <= 0 || err_result != 0 || soerr) {
     std::lock_guard<std::mutex> g(m_);
     if (failed_ip_ != f.ip) log_("headset " + f.ip + ": TCP connect failed");  // once per address, not every retry
     failed_ip_ = f.ip;
@@ -471,11 +481,7 @@ bool HeadsetLink::Session(const Found &f) {
       if (!SendAll(s, p)) break;
     }
     if (now - last_rx > 10) { log_("headset: nothing received for 10 s, reconnecting"); break; }
-    fd_set rf;
-    FD_ZERO(&rf);
-    FD_SET(s, &rf);
-    timeval t2{0, 50000};
-    int r = select((int)s + 1, &rf, nullptr, nullptr, &t2);
+    int r = WaitSocket(s, false, 50);
     if (r < 0) break;
     if (r == 0) continue;
     int n = recv(s, buf, sizeof buf, 0);

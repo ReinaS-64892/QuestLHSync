@@ -190,8 +190,9 @@ skipped. Stations in different origins, or an HMD sharing the Lighthouse origin,
 unrelated frames or moving the HMD.
 
 `./build.sh --wivrn` builds `out/questlhsync-xr` and packs it, SDL2 and a font into
-`out/QuestLHSync-wivrn.AppImage`. Start the app, then connect the headset: the app waits for it. Device and origin
-snapshots refresh once a second, including devices added after connection when the runtime supports hotplug.
+`out/QuestLHSync-wivrn.AppImage`. Start the app, then connect the headset: the app waits for it. OpenXR device
+snapshots refresh once a second, including devices added after connection when the runtime supports hotplug. The libmonado connection is reused while the device list stays the same; its cached device and origin
+snapshot is renewed when devices change, an IPC request fails, or the OpenXR session reconnects.
 The page's buttons pause the corrections and
 record a session. `--host IP` connects only to the specified address; comma-separated addresses are tried in order.
 It disables automatic discovery and remembered-address fallback, so an unavailable host never selects another headset.

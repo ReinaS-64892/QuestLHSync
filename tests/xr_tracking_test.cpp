@@ -6,9 +6,64 @@
 
 #include <cassert>
 #include <limits>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
 
 // Exercise the production candidate selection with two identical HMD models.
 struct HeadsetLinkTest {
+  static void ReconnectHighDescriptors() {
+    rlimit saved;
+    assert(getrlimit(RLIMIT_NOFILE, &saved) == 0);
+    rlimit raised = saved;
+    raised.rlim_cur = std::max<rlim_t>(raised.rlim_cur, FD_SETSIZE + 256);
+    assert(setrlimit(RLIMIT_NOFILE, &raised) == 0);
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    assert(listener >= 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(bind(listener, (sockaddr *)&addr, sizeof addr) == 0);
+    assert(listen(listener, 8) == 0);
+    socklen_t len = sizeof addr;
+    assert(getsockname(listener, (sockaddr *)&addr, &len) == 0);
+    // Reproduce descriptors left high by repeated libmonado snapshots.
+    std::vector<int> held;
+    do {
+      held.push_back(open("/dev/null", O_RDONLY | O_CLOEXEC));
+      assert(held.back() >= 0);
+    } while (held.back() < FD_SETSIZE + 128);
+    Sync sync({}, [](const std::string &) {});
+    HeadsetLink link(&sync, [](const std::string &) {}, [](double, const std::string &) {});
+    link.run_ = link.wanted_ = true;
+    std::thread server([&] {
+      for (int i = 0; i < 8; ++i) {
+        int peer = accept(listener, nullptr, nullptr);
+        assert(peer >= FD_SETSIZE);
+        const char hello[] = "H QuestLHSync 1 serial=test model=Quest_3 fw=test module=test\n";
+        assert(send(peer, hello, sizeof hello - 1, MSG_NOSIGNAL) == sizeof hello - 1);
+        char ping[128];
+        assert(recv(peer, ping, sizeof ping, 0) > 0);
+        shutdown(peer, SHUT_WR);
+        close(peer);
+      }
+    });
+    for (int i = 0; i < 8; ++i) {
+      assert(link.Session({"127.0.0.1", "", "", ntohs(addr.sin_port)}));
+      assert(link.model() == "Quest 3");
+    }
+    server.join();
+    close(listener);
+    for (int fd : held) close(fd);
+    // A failed socket() must never reach FD_SET(-1).
+    rlimit exhausted = saved;
+    exhausted.rlim_cur = 0;
+    assert(setrlimit(RLIMIT_NOFILE, &exhausted) == 0);
+    assert(!link.Session({"127.0.0.1", "", "", ntohs(addr.sin_port)}));
+    assert(setrlimit(RLIMIT_NOFILE, &saved) == 0);
+    link.run_ = false;
+  }
   static void Run() {
     HeadsetLink link(nullptr, [](const std::string &) {}, [](double, const std::string &) {});
     link.SetFamily("Steam Frame");
@@ -192,7 +247,9 @@ void TrackingTests() {
 std::vector<Dev> devices;
 struct Root { std::vector<Dev> devices; };
 int creates, destroys;
+bool fail_create, fail_role;
 mnd_result_t Create(mnd_root_t **root) {
+  if (fail_create) return MND_ERROR_CONNECTING_FAILED;
   *root = reinterpret_cast<mnd_root_t *>(new Root{devices});
   ++creates;
   return MND_SUCCESS;
@@ -208,7 +265,11 @@ mnd_result_t Count(mnd_root_t *root, uint32_t *out) {
 }
 mnd_result_t OriginCount(mnd_root_t *, uint32_t *out) { *out = 2; return MND_SUCCESS; }
 mnd_result_t OriginName(mnd_root_t *, uint32_t, const char **out) { *out = "origin"; return MND_SUCCESS; }
-mnd_result_t Role(mnd_root_t *, const char *, int32_t *out) { *out = 0; return MND_SUCCESS; }
+mnd_result_t Role(mnd_root_t *, const char *, int32_t *out) {
+  if (fail_role) return MND_ERROR_OPERATION_FAILED;
+  *out = 0;
+  return MND_SUCCESS;
+}
 mnd_result_t Info(mnd_root_t *root, uint32_t index, uint32_t *id, const char **name) {
   *id = index;
   *name = reinterpret_cast<Root *>(root)->devices.at(index).name.c_str();
@@ -261,18 +322,41 @@ void EnumerationTests() {
   std::vector<Dev> result;
   std::map<uint32_t, std::string> origins;
   assert(Enumerate(xr, mnd, result, origins) && result.size() == 1 && result[0].hmd);
+  auto *first = mnd.root;
+  for (int i = 0; i < 2048; ++i) {
+    assert(Enumerate(xr, mnd, result, origins) && result.size() == 1 && result[0].hmd);
+    assert(mnd.root == first && creates == 1 && destroys == 0);
+  }
   devices.push_back(Device(2, "LHB-12345678", 1, true));
+  fail_create = true;
+  assert(!Enumerate(xr, mnd, result, origins));
+  assert(result.empty() && mnd.root == first && destroys == 0);
+  fail_create = false; // A failed refresh must be retried for the same device list.
   assert(Enumerate(xr, mnd, result, origins) && result.size() == 2);
   assert(result[1].station && result[1].lighthouse && result[1].origin == 1);
+  assert(creates == 2 && destroys == 1);
+  devices[1].serial = "LHB-ABCDEF00"; // Same device count, different identity.
+  assert(Enumerate(xr, mnd, result, origins) && result[1].serial == "LHB-ABCDEF00");
+  assert(creates == 3 && destroys == 2);
   devices.resize(1);
   assert(Enumerate(xr, mnd, result, origins) && result.size() == 1);
+  assert(creates == 4 && destroys == 3);
+  fail_role = true; // A dead IPC connection must be replaced even without hotplug.
+  assert(!Enumerate(xr, mnd, result, origins) && result.empty() && !mnd.root);
+  fail_role = false;
+  assert(Enumerate(xr, mnd, result, origins) && result.size() == 1);
+  assert(creates == 5 && destroys == 4);
+  mnd.Disconnect(); // A new OpenXR session can expose exactly the same devices.
+  assert(Enumerate(xr, mnd, result, origins) && result.size() == 1);
+  assert(creates == 6 && destroys == 5);
   mnd.Disconnect();
-  assert(creates == 3 && destroys == creates);
+  assert(destroys == creates);
 }
 } // namespace
 
 int main() {
   HeadsetLinkTest::Run();
+  HeadsetLinkTest::ReconnectHighDescriptors();
   TrackingTests();
   EnumerationTests();
   puts("OpenXR tracking tests passed");

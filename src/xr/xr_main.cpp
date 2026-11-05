@@ -112,6 +112,7 @@ static mnd_pose_t ToMnd(const Rig &r) {
 struct Mnd {
   void *lib = nullptr;
   mnd_root_t *root = nullptr;
+  std::vector<std::string> device_snapshot;
   mnd_result_t (*create)(mnd_root_t **) = nullptr;
   void (*destroy)(mnd_root_t **) = nullptr;
   mnd_result_t (*count)(mnd_root_t *, uint32_t *) = nullptr;
@@ -149,9 +150,10 @@ struct Mnd {
     }
     return true;
   }
-  // libmonado caches device/origin lists at root creation. Refresh that snapshot
-  // alongside OpenXR's list so late base stations also get their correct origin.
-  bool Refresh() {
+  // libmonado caches devices/origins at creation. Keep the connection until
+  // OpenXR reports a different device snapshot, or an IPC request fails.
+  bool UpdateDevices(const std::vector<std::string> &snapshot) {
+    if (root && snapshot == device_snapshot) return true;
     mnd_root_t *fresh = nullptr;
     if (create(&fresh) != MND_SUCCESS || !fresh) {
       if (fresh) destroy(&fresh);
@@ -159,15 +161,13 @@ struct Mnd {
     }
     Disconnect();
     root = fresh;
+    device_snapshot = snapshot;
     return true;
-  }
-  bool Connect() {
-    if (root) return true;
-    return create(&root) == MND_SUCCESS && root;
   }
   void Disconnect() {
     if (root) destroy(&root);
     root = nullptr;
+    device_snapshot.clear();
   }
 };
 
@@ -294,7 +294,6 @@ static std::string Cut(const char *s) { return s ? s : ""; }
 
 // every xdev with a space, matched to libmonado's device of the same serial (else name) for its tracking origin
 static bool Enumerate(Xr &xr, Mnd &mnd, std::vector<Dev> &out, std::map<uint32_t, std::string> &origins) {
-  if (!mnd.Refresh()) return false;
   for (auto &d : out)
     if (d.space) xr.xrDestroySpace(d.space);
   out.clear();
@@ -308,20 +307,35 @@ static bool Enumerate(Xr &xr, Mnd &mnd, std::vector<Dev> &out, std::map<uint32_t
   std::vector<XrXDevIdMNDX> ids(n);
   if (n && XR_FAILED(xr.xrEnumerateXDevsMNDX(xr.list, n, &n, ids.data()))) return false;
 
+  // Recreate OpenXR's list to see hotplug even on runtimes with a constant
+  // generation number. Only replace libmonado's root when that list changes.
+  struct Entry { XrXDevIdMNDX id; XrXDevPropertiesMNDX props; };
+  std::vector<Entry> entries;
+  std::vector<std::string> snapshot;
+  for (XrXDevIdMNDX id : ids) {
+    XrGetXDevInfoMNDX gi{XR_TYPE_GET_XDEV_INFO_MNDX};
+    gi.id = id;
+    XrXDevPropertiesMNDX pr{XR_TYPE_XDEV_PROPERTIES_MNDX};
+    if (XR_FAILED(xr.xrGetXDevPropertiesMNDX(xr.list, &gi, &pr))) return false;
+    snapshot.insert(snapshot.end(), {std::to_string(id), pr.name, pr.serial, pr.canCreateSpace ? "1" : "0"});
+    entries.push_back({id, pr});
+  }
+  if (!mnd.UpdateDevices(snapshot)) return false;
+  auto failed_mnd = [&] { mnd.Disconnect(); return false; };
   uint32_t nm = 0, no = 0;
-  if (mnd.count(mnd.root, &nm) != MND_SUCCESS || mnd.origin_count(mnd.root, &no) != MND_SUCCESS) return false;
+  if (mnd.count(mnd.root, &nm) != MND_SUCCESS || mnd.origin_count(mnd.root, &no) != MND_SUCCESS) return failed_mnd();
   for (uint32_t i = 0; i < no; i++) {
     const char *nm_ = nullptr;
     if (mnd.origin_name(mnd.root, i, &nm_) == MND_SUCCESS) origins[i] = Cut(nm_);
   }
   int32_t head = -1;
-  mnd.role(mnd.root, "head", &head);
+  if (mnd.role(mnd.root, "head", &head) != MND_SUCCESS) return failed_mnd();
   struct M { std::string name, serial; uint32_t origin; };
   std::vector<M> ms(nm);
   for (uint32_t i = 0; i < nm; i++) {
     uint32_t id;
     const char *name = nullptr, *serial = nullptr;
-    if (mnd.info(mnd.root, i, &id, &name) != MND_SUCCESS) return false;
+    if (mnd.info(mnd.root, i, &id, &name) != MND_SUCCESS) return failed_mnd();
     std::string device_name = Cut(name); // returned strings need copying before the next libmonado call
     if (mnd.info_str(mnd.root, i, MND_PROPERTY_SERIAL_STRING, &serial) != MND_SUCCESS) serial = nullptr;
     std::string device_serial = Cut(serial);
@@ -329,11 +343,10 @@ static bool Enumerate(Xr &xr, Mnd &mnd, std::vector<Dev> &out, std::map<uint32_t
     if (mnd.info_u32(mnd.root, i, MND_PROPERTY_TRACKING_ORIGIN_U32, &o) != MND_SUCCESS) o = UINT32_MAX;
     ms[i] = {device_name, device_serial, o};
   }
-  for (XrXDevIdMNDX id : ids) {
-    XrGetXDevInfoMNDX gi{XR_TYPE_GET_XDEV_INFO_MNDX};
-    gi.id = id;
-    XrXDevPropertiesMNDX pr{XR_TYPE_XDEV_PROPERTIES_MNDX};
-    if (XR_FAILED(xr.xrGetXDevPropertiesMNDX(xr.list, &gi, &pr)) || !pr.canCreateSpace) continue;
+  for (const auto &entry : entries) {
+    const auto id = entry.id;
+    const auto &pr = entry.props;
+    if (!pr.canCreateSpace) continue;
     Dev d;
     d.id = id;
     d.name = pr.name;
@@ -703,7 +716,7 @@ static void Engine(const Options &o) {
       g_blocking = true;
       XrResult r = xr.Connect();
       g_blocking = false;
-      if (XR_FAILED(r) || !mnd.Connect()) {
+      if (XR_FAILED(r)) {
         if (!said_wait) note(Fmt("waiting for WiVRn/Monado with a headset connected (OpenXR result %d)", (int)r));
         said_wait = true;
         if (xr.inst) xr.Close();
@@ -730,8 +743,8 @@ static void Engine(const Options &o) {
     }
     if (!xr.running) { usleep(50000); continue; }
 
-    // Xdev lists and libmonado roots are snapshots; a list's generation may
-    // stay constant even after hotplug. Recreate both snapshots once a second.
+    // A list's generation may stay constant even after hotplug. Poll a fresh
+    // OpenXR snapshot once a second; libmonado stays connected until it changes.
     now = QpcNow(); // xrCreateInstance may have waited a long time for a headset
     if (now - last_gen >= 1) {
       last_gen = now;
